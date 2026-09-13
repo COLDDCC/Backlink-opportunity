@@ -5,7 +5,7 @@ import sys
 
 import click
 
-from . import stats as stats_mod
+from . import catalog, stats as stats_mod
 from .db import connect, get_or_create_site, normalize_domain, now_iso, kv_get, kv_set
 from .interactive import confirm_key, select_key
 from .linkcheck import check_link
@@ -15,6 +15,7 @@ from .util import parse_duration_hours
 BUCKETS = ("A", "B", "C", "D", "stale", "no_channel", "unknown")
 CAPTCHA_TYPES = ("none", "recaptcha", "hcaptcha", "cloudflare", "email_verify", "unknown")
 ATTEMPT_STATUSES = ("submitted", "approved", "rejected", "published", "no_response")
+LINK_FORMATS = ("article", "comment", "profile", "listing", "other")
 WAIT_PRESETS = (
     ("1", "几天内", "几天内"),
     ("2", "1-2 周", "1-2 周"),
@@ -179,15 +180,52 @@ def queue_cmd(ctx: click.Context, niche: str | None, exclude_bucket: tuple[str, 
     click.echo(f"\n共 {shown} 条待人工处理。" if shown else "队列为空。")
 
 
+@main.command(name="list")
+@click.option("--niche", default=None)
+@click.option("--bucket", "buckets", multiple=True, default=catalog.READY_BUCKETS, show_default=True,
+              help="只看这些桶位（默认排除 stale/no_channel/unknown，那些没法直接拿来用）")
+@click.option("--min-dr", type=int, default=None, help="DR/DA 下限")
+@click.option("--max-dr", type=int, default=None, help="DR/DA 上限")
+@click.option("--dofollow", type=click.Choice(["yes", "no", "any"]), default="any", show_default=True)
+@click.option("--link-format", type=click.Choice(LINK_FORMATS), default=None)
+@click.option("--suitable-for", default=None, help="按 suitable_for 关键词模糊匹配，如 tools")
+@click.pass_context
+def list_cmd(ctx: click.Context, niche: str | None, buckets: tuple[str, ...], min_dr: int | None,
+             max_dr: int | None, dofollow: str, link_format: str | None, suitable_for: str | None) -> None:
+    """按 DR / dofollow / 适用类型等条件筛选已确认可用的库存（不是待处理队列）。"""
+    conn = ctx.obj
+    rows = catalog.list_sites(
+        conn, niche=niche, buckets=tuple(buckets), min_dr=min_dr, max_dr=max_dr,
+        dofollow=dofollow, link_format=link_format, suitable_for=suitable_for,
+    )
+    if not rows:
+        click.echo("没有匹配的站点。")
+        return
+    for r in rows:
+        dr = str(r["domain_rating"]) if r["domain_rating"] is not None else "-"
+        df = {1: "dofollow", 0: "nofollow"}.get(r["is_dofollow"], "?")
+        click.echo(
+            f"{r['domain']:35s} bucket={r['bucket']:8s} DR={dr:>4s} {df:9s} "
+            f"格式={r['link_format'] or '-':10s} 适合={r['suitable_for'] or '-':15s} "
+            f"等待={r['expected_wait'] or '-'}"
+        )
+    click.echo(f"\n共 {len(rows)} 条。")
+
+
 @main.command(name="confirm")
 @click.argument("domain")
 @click.option("--bucket", type=click.Choice(BUCKETS), default=None)
 @click.option("--reason", default=None)
 @click.option("--suitable-for", default=None, help="这个位置适合哪类目标站，逗号分隔（如 tools,ai）")
 @click.option("--wait", "expected_wait", default=None, help="预计要等多久出结果（B/C 桶用）")
+@click.option("--dofollow/--nofollow", "is_dofollow", default=None, help="这个位置给的链接是不是 dofollow")
+@click.option("--link-format", type=click.Choice(LINK_FORMATS), default=None,
+              help="链接放在哪种形式里：article/comment/profile/listing/other")
+@click.option("--dr", "domain_rating", type=int, default=None, help="域名的 DR/DA，人工填")
 @click.pass_context
 def confirm_cmd(ctx: click.Context, domain: str, bucket: str | None, reason: str | None,
-                 suitable_for: str | None, expected_wait: str | None) -> None:
+                 suitable_for: str | None, expected_wait: str | None, is_dofollow: bool | None,
+                 link_format: str | None, domain_rating: int | None) -> None:
     """人工确认最终桶位，写回 sites.bucket。"""
     conn = ctx.obj
     domain = normalize_domain(domain)
@@ -236,16 +274,52 @@ def confirm_cmd(ctx: click.Context, domain: str, bucket: str | None, reason: str
             # interactive.select_key) so Enter is a valid quick pass-through
             # for the common "not sure yet" case.
             expected_wait = select_key("预计要等多久出结果：", WAIT_PRESETS, default=None)
+        if is_dofollow is None:
+            is_dofollow = select_key(
+                "链接是 dofollow 还是 nofollow：",
+                [("y", "dofollow", 1), ("n", "nofollow", 0), ("m", "不确定/看情况，跳过", None)],
+                default=None,
+            )
+        if link_format is None:
+            link_format = select_key(
+                "链接放在哪种形式里：",
+                [("1", "article 整篇文章/帖子", "article"), ("2", "comment 评论", "comment"),
+                 ("3", "profile 个人资料/签名链接", "profile"), ("4", "listing 目录收录条目", "listing"),
+                 ("5", "other 其他", "other"), ("0", "跳过", None)],
+                default=None,
+            )
+        if domain_rating is None:
+            dr_input = click.prompt(
+                "这个域名的 DR/DA（不知道就回车跳过）", default="", show_default=False
+            )
+            if dr_input:
+                try:
+                    domain_rating = int(dr_input)
+                except ValueError:
+                    click.echo(f"「{dr_input}」不是数字，DR 先不记。")
 
     conn.execute(
         """UPDATE sites SET bucket = ?, bucket_reason = ?, last_verified = ?,
                              suitable_for = COALESCE(?, suitable_for),
-                             expected_wait = COALESCE(?, expected_wait)
+                             expected_wait = COALESCE(?, expected_wait),
+                             is_dofollow = COALESCE(?, is_dofollow),
+                             link_format = COALESCE(?, link_format),
+                             domain_rating = COALESCE(?, domain_rating)
            WHERE id = ?""",
-        (bucket, reason, now_iso(), suitable_for, expected_wait, site["id"]),
+        (bucket, reason, now_iso(), suitable_for, expected_wait, is_dofollow, link_format,
+         domain_rating, site["id"]),
     )
     conn.commit()
-    click.echo(f"{domain} -> {bucket}" + (f" (适合: {suitable_for})" if suitable_for else ""))
+    extras = []
+    if suitable_for:
+        extras.append(f"适合: {suitable_for}")
+    if is_dofollow is not None:
+        extras.append("dofollow" if is_dofollow else "nofollow")
+    if link_format:
+        extras.append(f"形式: {link_format}")
+    if domain_rating is not None:
+        extras.append(f"DR: {domain_rating}")
+    click.echo(f"{domain} -> {bucket}" + (f" ({', '.join(extras)})" if extras else ""))
 
 
 @main.command(name="log")

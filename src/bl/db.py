@@ -32,7 +32,9 @@ CREATE TABLE IF NOT EXISTS sites (
   last_verified TEXT,
   notes TEXT,
   suitable_for TEXT,
-  expected_wait TEXT
+  expected_wait TEXT,
+  link_format TEXT,
+  domain_rating INTEGER
 );
 
 CREATE TABLE IF NOT EXISTS probes (
@@ -94,6 +96,8 @@ CREATE INDEX IF NOT EXISTS idx_link_checks_attempt ON link_checks(attempt_id);
 SITE_COLUMN_MIGRATIONS: dict[str, str] = {
     "suitable_for": "ALTER TABLE sites ADD COLUMN suitable_for TEXT",
     "expected_wait": "ALTER TABLE sites ADD COLUMN expected_wait TEXT",
+    "link_format": "ALTER TABLE sites ADD COLUMN link_format TEXT",
+    "domain_rating": "ALTER TABLE sites ADD COLUMN domain_rating INTEGER",
 }
 
 

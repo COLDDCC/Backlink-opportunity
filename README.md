@@ -34,9 +34,11 @@ bl queue --niche tools
 
 # 4. 人工确认最终桶位，写回 sites.bucket（探测器只做预判，不自动写回）
 bl confirm example.com --bucket A --reason "目录站，注册即收录" \
-   --suitable-for "tools,ai" --wait "2-4 周"
+   --suitable-for "tools,ai" --wait "2-4 周" --dofollow --link-format listing --dr 42
 #   不加 --bucket 会进入单键选择菜单，并显示探测器的预判和依据
-#   桶位是 A/B/C/D 时才会追问「适合哪类目标站」「预计要等多久」，
+#   桶位是 A/B/C/D 时才会追问「适合哪类目标站」「dofollow 还是 nofollow」
+#   「链接放在什么形式里（article/comment/profile/listing/other）」「DR 多少」，
+#   B/C 桶还会多问一句「预计要等多久」；
 #   D/stale/no_channel/unknown 问了也没意义，不会问
 #   压根没有外链渠道的站，直接 --bucket no_channel，跟「D=有渠道但是坑」分开记
 
@@ -56,6 +58,9 @@ bl revalidate --older-than 14d
 
 # 9. 出数：四桶占比 / 过审率 / 平均耗时（含提交到出结果的实际等待天数）/ 90 天存活率
 bl stats --niche tools
+
+# 10. 筛选已确认可用的库存（不是待处理队列，是"能直接拿去用"的那些）
+bl list --niche tools --min-dr 20 --max-dr 50 --dofollow yes --link-format article
 ```
 
 ## 数据模型
@@ -70,6 +75,14 @@ bl stats --niche tools
 - `sites.bucket` 多了一档 `no_channel`：跟 `D`（有渠道但是收费/是坑）分开，专指
   「压根没有任何外链/投稿入口，看一眼首页就能判断，不用深究」的站，两者归因完全不同，
   混在一起会让 D 桶的"坑"数据失真。
+- `sites.is_dofollow`（spec 原表就有，之前一直没人写）、`sites.link_format`、
+  `sites.domain_rating`：dofollow/nofollow、链接放在 article/comment/profile/listing/other
+  哪种形式里、DR/DA 多少。**DR 是人工填的**，第一阶段不接 Ahrefs/Moz 之类的付费 API，
+  也不去爬免费查询站（大概率有反爬，抓了也违反"不写反爬绕过"的原则）——你自己在别处查到
+  多少就填多少，查不到就跳过。
+- `bl list`：跟 `bl queue`（今天该人工处理哪些，还没定桶的）是两码事，`bl list` 是从**已经
+  confirm 过**的库存里按 DR/dofollow/形式/适用类型筛，回答"我现在手头有哪些能直接拿去用
+  的位置"这个问题。
 
 ## 探测器规则说明（`src/bl/prober.py`）
 
