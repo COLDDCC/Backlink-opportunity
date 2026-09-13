@@ -68,10 +68,15 @@ bl stats --niche tools
    联系邮箱是商务前缀（`seo@` `sales@` 等）、域名命中本地黑名单
    （`data/marketplace_domains.txt`，手工维护，抓取市场目录留到后面阶段）。
 2. **排队信号**：editorial calendar / allow 4-6 weeks / 要 portfolio 等，倾向 C。
-3. **活跃度信号**（核心判据）：尝试从 sitemap 的 `<lastmod>`（URL 含 author/contributor/blog）
-   或 `/author` `/contributors` `/blog` 页面里抓最新日期。
+3. **活跃度信号**（核心判据）：三层兜底——① sitemap 里 URL 含 author/contributor/blog 的
+   `<lastmod>`；② 常见的 sitemap **索引**结构（WordPress/Yoast 那种 `sitemap.xml` 只列
+   `post-sitemap.xml` `page-sitemap.xml` 这种子文件），会跟进抓最多 2 个文件名像
+   post/article/blog 的子 sitemap，取里面最新的 `<lastmod>`；③ 都没有就退化成扫
+   `/author` `/contributors` `/blog` 页面里的日期。
    **诚实说明局限**：spec 里描述的 `site:域名 inurl:author/` 需要搜索引擎 API，第一阶段没有
-   接入（避免抓 Google 搜索结果触发限流/验证码），所以这是一个近似启发式，不是精确复现。
+   接入（避免抓 Google 搜索结果触发限流/验证码），所以这是一个近似启发式，不是精确复现，
+   而且第②层拿到的是「网站最近有没有发文章」而不是「最近有没有发**外部投稿**文章」——
+   两者不完全等价，只是相关性够强的代理指标。
    查不到或 >180 天 → 标 `stale`，不进人工队列；这也是为什么 `bl queue` 默认排除 stale。
 4. **平台指纹**：命中 Discourse/phpBB/XenForo 等论坛平台 + 30 天内有活跃 → 倾向 A。
 
@@ -79,12 +84,21 @@ bl stats --niche tools
 `bl confirm`，这是人在回路里，符合 spec「探测器只做预判」的要求。
 
 `bl revalidate` 是例外：库存复检时如果判定已死，会自动把 `sites.bucket` 降级为 `stale`
-（spec 明确允许，降级不需要人工确认，只有升级/首次定桶才需要）。
+（spec 明确允许，降级不需要人工确认，只有升级/首次定桶才需要）。如果复检时首页打不开/被拦截，
+不会自动降级——不确定的信号不该拿来杀活的库存，只会打印出来提醒人工复查。
 
 ## 网络请求约束
 
 - 固定 UA，超时 10s，失败重试 1 次，任何单个域名的异常都不会中断整批探测。
 - 不写验证码/反爬绕过逻辑。遇到 403 / Cloudflare 挑战，如实记录状态码，交给人处理。
+- **首页打不开或被拦截（DNS 失败/超时/403/429/503）会直接短路返回**，不会傻乎乎地把剩下
+  20 多个路径全跑一遍再各自超时——一个死域名不该拖垮"200 个域名 10 分钟跑完"的整批预算。
+  极少数情况下你明知道某个域名的首页响应有问题但路径其实是通的，可以用 `bl probe --force`
+  强制跳过这个短路逻辑。
+- **会区分"网站真的拦你"和"你自己的出网环境拦了你"**：如果 `bl` 跑在类似 Claude Code
+  沙盒这种默认拒绝出网白名单外域名的环境里，代理会返回一个跟真实网站长得很像的 403，
+  这时候探测器不会瞎猜"可能是 Cloudflare"，而是如实说明是本地网络策略拦截，需要换一个
+  能正常出网的环境重跑才能得出真实判断。
 
 ## 测试
 

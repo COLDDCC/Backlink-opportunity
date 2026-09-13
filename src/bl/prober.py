@@ -87,10 +87,26 @@ MONTH_NAME_RE = re.compile(
 )
 
 DEFAULT_BLACKLIST_PATH = Path("data/marketplace_domains.txt")
+# fallback for when `bl` is run from outside the repo root (installed package)
+PACKAGE_BLACKLIST_PATH = Path(__file__).resolve().parent.parent.parent / "data" / "marketplace_domains.txt"
+
+# home page statuses that mean "don't bother probing further paths" — either
+# the domain is unreachable, or it's actively blocking us (Cloudflare/WAF).
+# Per spec: record honestly, don't try to work around it.
+BLOCKED_HOME_STATUSES = {403, 429, 503}
 
 
-def _load_marketplace_blacklist(path: Path = DEFAULT_BLACKLIST_PATH) -> set[str]:
-    if not path.exists():
+def _load_marketplace_blacklist(path: Path | None = None) -> set[str]:
+    import os
+
+    candidates = [
+        Path(os.environ["BL_MARKETPLACE_BLACKLIST"]) if os.environ.get("BL_MARKETPLACE_BLACKLIST") else None,
+        path,
+        DEFAULT_BLACKLIST_PATH,
+        PACKAGE_BLACKLIST_PATH,
+    ]
+    path = next((p for p in candidates if p is not None and p.exists()), None)
+    if path is None:
         return set()
     domains = set()
     for line in path.read_text(encoding="utf-8", errors="ignore").splitlines():
@@ -169,27 +185,53 @@ def _extract_dates(text: str) -> list[datetime]:
     return found
 
 
+SUB_SITEMAP_RE = re.compile(r"(post|article|blog)[-_]?sitemap|sitemap[-_]?(post|article|blog)", re.IGNORECASE)
+
+
 def _detect_activity(session: requests.Session, base: str) -> Optional[str]:
     """Best-effort latest guest-authored post date.
 
     Phase 1 has no search-engine API, so we approximate `site:domain
-    inurl:author/` with: sitemap lastmod entries whose URL mentions
-    author/contributor, then a plain scan of common author/blog listing
-    pages for dates. This is a heuristic, not ground truth — the human
-    queue review is still the final check.
+    inurl:author/` with three falling-back layers:
+
+    1. A flat sitemap.xml with per-URL <lastmod>, filtered to URLs that
+       look like author/contributor/blog pages (most precise when present).
+    2. A sitemap INDEX (the common WordPress/Yoast shape: sitemap.xml just
+       lists post-sitemap.xml, page-sitemap.xml, ...) — follow up to 2
+       sub-sitemaps whose filename suggests posts/articles/blog and take
+       the max <lastmod> across their entries. Less precise (it proves
+       "site is still publishing", not "still publishing GUEST posts")
+       but layer 1 alone misses this very common sitemap shape entirely.
+    3. A plain scan of /author, /contributors, /blog for visible dates.
+
+    This is a heuristic, not ground truth — human queue review is the
+    final check.
     """
     candidates: list[datetime] = []
+    sitemap_entries: list[tuple[str, str]] = []
     for sitemap_path in ("/sitemap.xml", "/sitemap_index.xml"):
         resp = _fetch(session, base + sitemap_path)
         if resp is None or resp.status_code != 200:
             continue
-        text = resp.text
-        for m in re.finditer(r"<loc>([^<]+)</loc>\s*(?:<lastmod>([^<]+)</lastmod>)?", text, re.IGNORECASE):
-            loc, lastmod = m.groups()
-            if lastmod and re.search(r"author|contributor|/blog/", loc, re.IGNORECASE):
-                candidates.extend(_extract_dates(f"<lastmod>{lastmod}</lastmod>"))
-        if candidates:
+        sitemap_entries = re.findall(
+            r"<loc>([^<]+)</loc>\s*(?:<lastmod>([^<]+)</lastmod>)?", resp.text, re.IGNORECASE
+        )
+        if sitemap_entries:
             break
+
+    for loc, lastmod in sitemap_entries:
+        if lastmod and re.search(r"author|contributor|/blog/", loc, re.IGNORECASE):
+            candidates.extend(_extract_dates(f"<lastmod>{lastmod}</lastmod>"))
+
+    if not candidates and sitemap_entries:
+        sub_sitemaps = [loc for loc, _ in sitemap_entries if SUB_SITEMAP_RE.search(loc)]
+        for sub_url in sub_sitemaps[:2]:
+            resp = _fetch(session, sub_url)
+            if resp is None or resp.status_code != 200:
+                continue
+            for m in re.finditer(r"<lastmod>([^<]+)</lastmod>", resp.text, re.IGNORECASE):
+                candidates.extend(_extract_dates(f"<lastmod>{m.group(1)}</lastmod>"))
+
     if not candidates:
         for listing_path in ("/author", "/contributors", "/blog"):
             resp = _fetch(session, base + listing_path)
@@ -216,14 +258,31 @@ def _activity_tendency(latest_author_post: Optional[str]) -> str:
     return "stale"
 
 
+def _looks_like_egress_policy_block(resp: requests.Response) -> bool:
+    """Detect a restricted-egress sandbox's own denial page, as opposed to
+    a real response from the target site. Anthropic's Claude Code remote
+    environments (and similar CI/agent sandboxes) proxy all outbound HTTPS
+    and, for a host not on their allowlist, hand back a same-shaped 403
+    with this exact body instead of ever reaching the real site."""
+    if resp.status_code != 403:
+        return False
+    body = resp.text or ""
+    return len(body) < 500 and "not in allowlist" in body.lower()
+
+
 def probe_site(
     domain: str,
     blacklist: Optional[set[str]] = None,
     session: Optional[requests.Session] = None,
     base_url: Optional[str] = None,
+    force: bool = False,
 ) -> ProbeResult:
     """`base_url` overrides the https://{domain} guess — used by tests to
     point the prober at a local fixture server instead of the real internet.
+
+    `force` skips the "homepage unreachable/blocked -> stop early" short
+    circuit, for the rare manual re-check of a domain you have reason to
+    believe works despite a bad homepage response.
     """
     result = ProbeResult(domain=domain)
     blacklist = blacklist if blacklist is not None else _load_marketplace_blacklist()
@@ -242,6 +301,32 @@ def probe_site(
         home_text = home.text if home is not None else ""
         home_status = home.status_code if home is not None else "ERR"
         result.raw["home_status"] = home_status
+
+        # Domain unreachable or actively blocking us — record honestly and
+        # stop. Don't burn ~20s * 26 paths finding out the same thing 26
+        # times; that's what let one dead domain blow the "200 domains in
+        # 10 minutes" budget for the whole batch.
+        if not force and (home is None or home_status in BLOCKED_HOME_STATUSES):
+            result.predicted_bucket = "unknown"
+            result.raw["blocked"] = True
+            if home is None:
+                result.bucket_reason = "域名无法访问（DNS/连接失败/超时），未做进一步探测，需人工检查"
+            elif _looks_like_egress_policy_block(home):
+                # Claude Code sandboxes (and similar restricted-egress
+                # environments) return their own synthetic 403 for any host
+                # not on the network allowlist — that's OUR outbound policy
+                # denying the request, not the target site's Cloudflare/WAF.
+                # Mislabeling this as "site blocks us" would be actively
+                # wrong data going into the bucket. Say what actually happened.
+                result.bucket_reason = (
+                    "当前运行环境的出网白名单拦截了这个域名（不是目标网站本身的响应），"
+                    "需要在开放出网的环境下重新探测才能得出真实判断"
+                )
+                result.raw["network_policy_blocked"] = True
+            else:
+                result.bucket_reason = f"首页返回 {home_status}（可能是 Cloudflare/WAF 拦截），如实记录，未做绕过"
+            result.predict_confidence = 0.2
+            return result
 
         # path probing
         for path in ALL_PATHS:
@@ -343,17 +428,18 @@ def probe_site(
             session.close()
 
 
-def probe_batch(domains: list[str], concurrency: int = 8, on_result=None) -> list[ProbeResult]:
+def probe_batch(domains: list[str], concurrency: int = 8, on_result=None, force: bool = False) -> list[ProbeResult]:
     """Probe many domains concurrently. `on_result(result)` is called from
-    worker threads as each domain finishes, so callers can stream progress
-    and persist to the DB without waiting for the whole batch."""
+    the calling thread (not the worker pool) as each domain finishes, so
+    callers can stream progress and write to a single sqlite connection
+    — which isn't thread-safe — without waiting for the whole batch."""
     blacklist = _load_marketplace_blacklist()
     results: list[ProbeResult] = []
     lock = threading.Lock()
 
     def _worker(d: str) -> ProbeResult:
         try:
-            return probe_site(d, blacklist=blacklist)
+            return probe_site(d, blacklist=blacklist, force=force)
         except Exception as exc:  # noqa: BLE001 - never let one domain kill the batch
             r = ProbeResult(domain=d)
             r.predicted_bucket = "unknown"

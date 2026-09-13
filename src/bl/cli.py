@@ -9,7 +9,7 @@ from . import stats as stats_mod
 from .db import connect, get_or_create_site, normalize_domain, now_iso, kv_get, kv_set
 from .interactive import confirm_key, select_key
 from .linkcheck import check_link
-from .prober import probe_batch, probe_site, result_to_row
+from .prober import ENTRY_PATHS, probe_batch, probe_site, result_to_row
 from .util import parse_duration_hours
 
 BUCKETS = ("A", "B", "C", "D", "stale", "unknown")
@@ -62,9 +62,11 @@ def import_cmd(ctx: click.Context, file: str, niche: str, source: str | None, ch
 @click.option("--domain", "domains_opt", multiple=True, help="只探测这些域名（忽略 --niche/--limit 的候选筛选）")
 @click.option("--include-bucket", "include_buckets", multiple=True,
               help="默认只探测 unknown 的站点；加此选项可以把已分桶的站点也纳入重新探测候选")
+@click.option("--force", is_flag=True, default=False,
+              help="跳过「首页打不开/被拦截就提前退出」的短路逻辑，强制跑完整套路径探测")
 @click.pass_context
 def probe_cmd(ctx: click.Context, niche: str | None, limit: int, concurrency: int,
-              domains_opt: tuple[str, ...], include_buckets: tuple[str, ...]) -> None:
+              domains_opt: tuple[str, ...], include_buckets: tuple[str, ...], force: bool) -> None:
     """批量探测，输出四桶预判 + 依据。"""
     conn = ctx.obj
     if domains_opt:
@@ -115,7 +117,7 @@ def probe_cmd(ctx: click.Context, niche: str | None, limit: int, concurrency: in
         counts[res.predicted_bucket] = counts.get(res.predicted_bucket, 0) + 1
         click.echo(f"  {res.domain:35s} -> {res.predicted_bucket:8s}  {res.bucket_reason}")
 
-    probe_batch(list(domains), concurrency=concurrency, on_result=on_result)
+    probe_batch(list(domains), concurrency=concurrency, on_result=on_result, force=force)
 
     click.echo("\n完成。四桶预判分布：")
     for b, n in sorted(counts.items()):
@@ -144,7 +146,9 @@ def queue_cmd(ctx: click.Context, niche: str | None, exclude_bucket: tuple[str, 
     if niche:
         q += " AND s.niche = ?"
         params.append(niche)
-    q += " ORDER BY p.predict_confidence DESC NULLS LAST, s.domain ASC"
+    # (predict_confidence IS NULL) sorts 0 (has a value) before 1 (NULL) —
+    # portable "NULLS LAST" without depending on SQLite >= 3.30 syntax
+    q += " ORDER BY (p.predict_confidence IS NULL), p.predict_confidence DESC, s.domain ASC"
     rows = conn.execute(q, params).fetchall()
 
     excluded = {b.upper() for b in exclude_bucket}
@@ -249,7 +253,9 @@ def log_cmd(ctx: click.Context, domain: str, entry: str | None, register: bool |
         if latest_probe and latest_probe["paths_found"]:
             try:
                 paths = json.loads(latest_probe["paths_found"])
-                candidates = [p for p, status_code in paths.items() if status_code == 200]
+                # only offer entry-style paths — not /pricing, /register etc.
+                # that happen to also 200 (see ALL_PATHS in prober.py)
+                candidates = [p for p in ENTRY_PATHS if paths.get(p) == 200]
             except json.JSONDecodeError:
                 candidates = []
         if candidates:
@@ -433,6 +439,11 @@ def revalidate_cmd(ctx: click.Context, older_than: str, niche: str | None, limit
             )
             downgraded += 1
             click.echo(f"  {site['domain']:35s} 降级 -> {res.predicted_bucket}  {res.bucket_reason}")
+        elif res.raw.get("blocked"):
+            # unreachable/blocked right now isn't proof it's dead — could be
+            # a transient WAF trip. Don't downgrade on a guess; leave the
+            # bucket as-is and flag it for a human to actually look at.
+            click.echo(f"  {site['domain']:35s} 无法访问/被拦截，未改动桶位，建议人工复查  {res.bucket_reason}")
         else:
             conn.execute("UPDATE sites SET last_verified = ? WHERE id = ?", (now_iso(), site["id"]))
             click.echo(f"  {site['domain']:35s} 仍然活着 ({site['bucket']})")

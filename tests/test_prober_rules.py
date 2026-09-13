@@ -66,3 +66,59 @@ def test_probe_site_no_activity_is_stale(fixture_server):
     fixture_server.routes["/"] = (200, "<html>a very quiet website</html>")
     result = probe_site("fixture.test", base_url=fixture_server.base_url)
     assert result.predicted_bucket == "stale"
+
+
+def test_probe_site_blocked_homepage_short_circuits(fixture_server):
+    fixture_server.routes["/"] = (403, "blocked by WAF")
+    result = probe_site("fixture.test", base_url=fixture_server.base_url)
+    assert result.predicted_bucket == "unknown"
+    assert result.raw.get("blocked") is True
+    # the whole point: no path probing happened after the 403
+    assert result.paths_found == {}
+
+
+def test_probe_site_distinguishes_egress_policy_block_from_real_waf(fixture_server):
+    fixture_server.routes["/"] = (
+        403, "Host not in allowlist: fixture.test. Add this host to your network egress settings to allow access.",
+    )
+    result = probe_site("fixture.test", base_url=fixture_server.base_url)
+    assert result.raw.get("network_policy_blocked") is True
+    assert "出网白名单" in result.bucket_reason
+    assert "Cloudflare" not in result.bucket_reason  # don't blame the site for our own sandbox's policy
+
+
+def test_probe_site_unreachable_short_circuits(fixture_server):
+    base_url = fixture_server.base_url
+    fixture_server.stop()  # port is now closed -> connection refused
+    result = probe_site("fixture.test", base_url=base_url)
+    assert result.predicted_bucket == "unknown"
+    assert result.raw.get("blocked") is True
+    assert result.paths_found == {}
+
+
+def test_probe_site_force_bypasses_short_circuit(fixture_server):
+    fixture_server.routes["/"] = (403, "blocked by WAF")
+    result = probe_site("fixture.test", base_url=fixture_server.base_url, force=True)
+    assert result.raw.get("blocked") is not True
+    assert result.paths_found  # path probing actually ran
+
+
+def test_probe_site_follows_sitemap_index_to_post_sitemap(fixture_server):
+    now_str = datetime.now(timezone.utc).date().isoformat()
+    base = fixture_server.base_url
+    fixture_server.routes["/"] = (200, "<html>a wordpress-shaped blog</html>")
+    fixture_server.routes["/write-for-us"] = (200, "<html>send us your post</html>")
+    fixture_server.routes["/sitemap.xml"] = (
+        200,
+        f"<sitemapindex>"
+        f"<sitemap><loc>{base}/page-sitemap.xml</loc></sitemap>"
+        f"<sitemap><loc>{base}/post-sitemap.xml</loc></sitemap>"
+        f"</sitemapindex>",
+    )
+    fixture_server.routes["/post-sitemap.xml"] = (
+        200,
+        f"<urlset><url><loc>{base}/2024/some-guest-post</loc><lastmod>{now_str}</lastmod></url></urlset>",
+    )
+    result = probe_site("fixture.test", base_url=base)
+    assert result.latest_author_post == now_str
+    assert result.predicted_bucket in ("A", "B")

@@ -16,6 +16,7 @@ class FixtureServer:
         handler = self._make_handler()
         self.httpd = HTTPServer(("127.0.0.1", 0), handler)
         self.thread = threading.Thread(target=self.httpd.serve_forever, daemon=True)
+        self._stopped = False
 
     def _make_handler(self):
         routes = self.routes
@@ -49,8 +50,12 @@ class FixtureServer:
         self.thread.start()
 
     def stop(self):
+        if self._stopped:
+            return
+        self._stopped = True
         self.httpd.shutdown()
         self.thread.join(timeout=5)
+        self.httpd.server_close()  # release the port so a later connect() fails fast
 
 
 @pytest.fixture
