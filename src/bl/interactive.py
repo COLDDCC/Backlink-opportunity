@@ -33,17 +33,24 @@ def _read_one_char() -> str:
         return line[0] if line else ""
 
 
-def select_key(prompt: str, options: list[tuple[str, str, object]], default: object = None) -> object:
+_NO_DEFAULT = object()  # distinct from any real option value, including None
+
+
+def select_key(prompt: str, options: list[tuple[str, str, object]], default: object = _NO_DEFAULT) -> object:
     """Show a prompt and a list of (key, label, value) options.
 
     Returns the value for the pressed key. Enter/space accepts `default`
-    if one is given. Ctrl-C / Ctrl-D aborts (raises KeyboardInterrupt /
-    EOFError, same as any other prompt).
+    if one was given — including a default value of `None` (e.g. an
+    explicit "skip" option), which is why "no default" is its own sentinel
+    rather than plain `None`: those need to stay distinguishable. Ctrl-C /
+    Ctrl-D aborts (raises KeyboardInterrupt / EOFError, same as any other
+    prompt).
     """
+    has_default = default is not _NO_DEFAULT
     key_map = {k.lower(): v for k, _, v in options}
     lines = [prompt]
-    for k, label, _ in options:
-        marker = "*" if options and default is not None and key_map.get(k.lower()) == default else " "
+    for k, label, v in options:
+        marker = "*" if has_default and v == default else " "
         lines.append(f"  [{k}]{marker} {label}")
     sys.stdout.write("\n".join(lines) + "\n> ")
     sys.stdout.flush()
@@ -55,7 +62,7 @@ def select_key(prompt: str, options: list[tuple[str, str, object]], default: obj
         if ch in ("\x04", ""):
             sys.stdout.write("\n")
             raise EOFError
-        if ch in ("\r", "\n", " ") and default is not None:
+        if ch in ("\r", "\n", " ") and has_default:
             sys.stdout.write(f"{ch}\n")
             return default
         if ch.lower() in key_map:

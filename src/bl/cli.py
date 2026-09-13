@@ -217,8 +217,8 @@ def confirm_cmd(ctx: click.Context, domain: str, bucket: str | None, reason: str
             ("d", "D 假免费", "D"), ("s", "stale 已死", "stale"),
             ("x", "no_channel 没有外链渠道，直接跳过", "no_channel"), ("u", "unknown 待定", "unknown"),
         ]
-        default = predicted if predicted in BUCKETS else None
-        bucket = select_key(f"确认 {domain} 的最终桶位：", options, default=default)
+        select_kwargs = {"default": predicted} if predicted in BUCKETS else {}
+        bucket = select_key(f"确认 {domain} 的最终桶位：", options, **select_kwargs)
 
     if reason is None:
         reason = predicted_reason
@@ -232,6 +232,9 @@ def confirm_cmd(ctx: click.Context, domain: str, bucket: str | None, reason: str
                 default=site["suitable_for"] or "", show_default=False,
             ) or None
         if bucket in ("B", "C") and expected_wait is None:
+            # default=None (a real "skip" option, not "no default" — see
+            # interactive.select_key) so Enter is a valid quick pass-through
+            # for the common "not sure yet" case.
             expected_wait = select_key("预计要等多久出结果：", WAIT_PRESETS, default=None)
 
     conn.execute(

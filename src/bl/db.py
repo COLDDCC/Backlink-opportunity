@@ -30,7 +30,9 @@ CREATE TABLE IF NOT EXISTS sites (
   source TEXT,
   first_seen TEXT,
   last_verified TEXT,
-  notes TEXT
+  notes TEXT,
+  suitable_for TEXT,
+  expected_wait TEXT
 );
 
 CREATE TABLE IF NOT EXISTS probes (
@@ -84,10 +86,11 @@ CREATE INDEX IF NOT EXISTS idx_attempts_site ON attempts(site_id);
 CREATE INDEX IF NOT EXISTS idx_link_checks_attempt ON link_checks(attempt_id);
 """
 
-# Columns added after the initial schema. `CREATE TABLE IF NOT EXISTS`
-# doesn't add columns to an already-existing table, so new columns land
-# here and get backfilled onto old bl.db files on next connect() — no
-# separate migration command to remember to run.
+# Columns added after the initial schema (they're already in the CREATE
+# TABLE above for anyone starting fresh). `CREATE TABLE IF NOT EXISTS`
+# doesn't add columns to an already-existing table, so an existing bl.db
+# from before these columns existed needs them backfilled — which happens
+# automatically on next connect(), no separate migration command to run.
 SITE_COLUMN_MIGRATIONS: dict[str, str] = {
     "suitable_for": "ALTER TABLE sites ADD COLUMN suitable_for TEXT",
     "expected_wait": "ALTER TABLE sites ADD COLUMN expected_wait TEXT",
