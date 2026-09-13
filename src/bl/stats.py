@@ -48,6 +48,35 @@ def attempt_stats(conn: sqlite3.Connection, niche: str | None) -> dict:
     }
 
 
+def turnaround_days_stats(conn: sqlite3.Connection, niche: str | None) -> dict:
+    """Calendar days from submission to a terminal outcome (approved /
+    rejected / published) — how long you actually had to wait, as opposed
+    to `time_cost_min` (how many minutes YOU spent on the submission
+    itself). Surfaces the max too: a single very-long wait can hide inside
+    a fine-looking average, and that's exactly the number that matters for
+    deciding whether a C-bucket site is worth submitting to at all.
+    """
+    q = """SELECT a.submitted_at, a.status_at FROM attempts a
+           JOIN sites s ON s.id = a.site_id
+           WHERE a.status IN ('approved', 'rejected', 'published')"""
+    params: list = []
+    if niche:
+        q += " AND s.niche = ?"
+        params.append(niche)
+    rows = conn.execute(q, params).fetchall()
+    days: list[float] = []
+    for r in rows:
+        try:
+            submitted = datetime.fromisoformat(r["submitted_at"])
+            resolved = datetime.fromisoformat(r["status_at"])
+        except (TypeError, ValueError):
+            continue
+        days.append((resolved - submitted).total_seconds() / 86400)
+    if not days:
+        return {"n": 0, "avg_days": None, "max_days": None}
+    return {"n": len(days), "avg_days": sum(days) / len(days), "max_days": max(days)}
+
+
 def survival_rate_90d(conn: sqlite3.Connection, niche: str | None, now: datetime | None = None) -> dict:
     now = now or datetime.now(timezone.utc)
     cutoff = (now - timedelta(days=90)).isoformat()

@@ -1,3 +1,5 @@
+import sqlite3
+
 from bl.db import connect, get_or_create_site, normalize_domain
 
 
@@ -18,3 +20,27 @@ def test_get_or_create_site_is_idempotent(tmp_path):
     assert row["domain"] == "example.com"
     assert row["bucket"] == "unknown"
     assert row["source"] == "unit-test"
+
+
+def test_migration_adds_new_columns_to_pre_existing_db(tmp_path):
+    """Simulate a bl.db created before suitable_for/expected_wait existed —
+    connect() must backfill the columns without losing existing rows."""
+    path = str(tmp_path / "old.db")
+    old_conn = sqlite3.connect(path)
+    old_conn.execute(
+        """CREATE TABLE sites (
+            id INTEGER PRIMARY KEY, domain TEXT UNIQUE NOT NULL, niche TEXT,
+            channel_type TEXT, bucket TEXT, bucket_reason TEXT, entry_url TEXT,
+            needs_register INTEGER, captcha_type TEXT, is_dofollow INTEGER,
+            cost_note TEXT, source TEXT, first_seen TEXT, last_verified TEXT, notes TEXT
+        )"""
+    )
+    old_conn.execute("INSERT INTO sites (domain, bucket) VALUES ('legacy.com', 'A')")
+    old_conn.commit()
+    old_conn.close()
+
+    conn = connect(path)
+    row = conn.execute("SELECT * FROM sites WHERE domain = 'legacy.com'").fetchone()
+    assert row["bucket"] == "A"
+    assert row["suitable_for"] is None
+    assert row["expected_wait"] is None

@@ -84,9 +84,26 @@ CREATE INDEX IF NOT EXISTS idx_attempts_site ON attempts(site_id);
 CREATE INDEX IF NOT EXISTS idx_link_checks_attempt ON link_checks(attempt_id);
 """
 
+# Columns added after the initial schema. `CREATE TABLE IF NOT EXISTS`
+# doesn't add columns to an already-existing table, so new columns land
+# here and get backfilled onto old bl.db files on next connect() — no
+# separate migration command to remember to run.
+SITE_COLUMN_MIGRATIONS: dict[str, str] = {
+    "suitable_for": "ALTER TABLE sites ADD COLUMN suitable_for TEXT",
+    "expected_wait": "ALTER TABLE sites ADD COLUMN expected_wait TEXT",
+}
+
 
 def now_iso() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def _apply_migrations(conn: sqlite3.Connection) -> None:
+    existing = {row["name"] for row in conn.execute("PRAGMA table_info(sites)")}
+    for column, ddl in SITE_COLUMN_MIGRATIONS.items():
+        if column not in existing:
+            conn.execute(ddl)
+    conn.commit()
 
 
 def connect(db_path: str | None = None) -> sqlite3.Connection:
@@ -96,6 +113,7 @@ def connect(db_path: str | None = None) -> sqlite3.Connection:
     conn.execute("PRAGMA foreign_keys = ON")
     conn.executescript(SCHEMA)
     conn.commit()
+    _apply_migrations(conn)
     return conn
 
 

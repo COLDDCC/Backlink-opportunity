@@ -33,8 +33,12 @@ bl probe --niche tools --limit 200 --concurrency 8
 bl queue --niche tools
 
 # 4. 人工确认最终桶位，写回 sites.bucket（探测器只做预判，不自动写回）
-bl confirm example.com --bucket A --reason "目录站，注册即收录"
+bl confirm example.com --bucket A --reason "目录站，注册即收录" \
+   --suitable-for "tools,ai" --wait "2-4 周"
 #   不加 --bucket 会进入单键选择菜单，并显示探测器的预判和依据
+#   桶位是 A/B/C/D 时才会追问「适合哪类目标站」「预计要等多久」，
+#   D/stale/no_channel/unknown 问了也没意义，不会问
+#   压根没有外链渠道的站，直接 --bucket no_channel，跟「D=有渠道但是坑」分开记
 
 # 5. 记录一次投递 —— 10 秒内完成，缺什么补什么，全部单键选择不用打字
 bl log example.com --entry /write-for-us --register --captcha recaptcha \
@@ -50,15 +54,22 @@ bl recheck --older-than 30d
 # 8. 库存复检：投稿入口是否还开着（判定已死会自动降级为 stale，不需要人工确认）
 bl revalidate --older-than 14d
 
-# 9. 出数：四桶占比 / 过审率 / 平均耗时 / 90 天存活率
+# 9. 出数：四桶占比 / 过审率 / 平均耗时（含提交到出结果的实际等待天数）/ 90 天存活率
 bl stats --niche tools
 ```
 
 ## 数据模型
 
-严格照搬 spec：`sites`（站点主表，一域名一行）、`probes`（每次探测留痕）、
-`attempts`（每次投递留痕）、`link_checks`（存活复检留痕）。另加一张 `kv` 表，只用来记
-`bl log` 里「上次投给哪个站」，好让交互式记录能单键复用。
+基本照搬 spec：`sites`（站点主表，一域名一行）、`probes`（每次探测留痕）、
+`attempts`（每次投递留痕）、`link_checks`（存活复检留痕）。另加两张东西：
+
+- `kv` 表：只用来记 `bl log` 里「上次投给哪个站」，好让交互式记录能单键复用。
+- `sites.suitable_for` / `sites.expected_wait`：spec 原表没有，是跑起来之后加的两个字段——
+  「这个位置适合投给哪类目标站」和「B/C 桶大概要等多久出结果」，`bl confirm` 时顺手问一句，
+  跳过不填也行。老的 `bl.db` 文件不用手动迁移，`connect()` 时会自动补上这两列。
+- `sites.bucket` 多了一档 `no_channel`：跟 `D`（有渠道但是收费/是坑）分开，专指
+  「压根没有任何外链/投稿入口，看一眼首页就能判断，不用深究」的站，两者归因完全不同，
+  混在一起会让 D 桶的"坑"数据失真。
 
 ## 探测器规则说明（`src/bl/prober.py`）
 
@@ -86,6 +97,19 @@ bl stats --niche tools
 `bl revalidate` 是例外：库存复检时如果判定已死，会自动把 `sites.bucket` 降级为 `stale`
 （spec 明确允许，降级不需要人工确认，只有升级/首次定桶才需要）。如果复检时首页打不开/被拦截，
 不会自动降级——不确定的信号不该拿来杀活的库存，只会打印出来提醒人工复查。
+
+### 关于 `expected_wait` 的一个待定产品问题
+
+C 桶「要排队」和「可能要排一年」在数据上是同一档，但对「按提交数考核」的目标用户来说价值
+完全不同——很多站自己都活不过一年。`expected_wait` 只负责把这个数字如实记下来，**要不要在
+用户看到的地方把等待很久的位置往后放（而不是删掉/瞒报）**是留给以后做对外展示时决定的产品
+判断，现在没有前端，不需要在这里定。
+
+### 关于付费评测（还没做）
+
+「买了某个站的付费额度实际能拿到什么效果，跟官方自称的对比」需要一张新表（价位/官方承诺/
+实测效果）和一套完全不同的工作流（真金白银去买测，不是每天批量探测）。这已经是 spec 第三
+阶段"D 桶公开"性质的内容层工作，第一阶段先不做，等前面的数据跑出来再看要不要启动。
 
 ## 网络请求约束
 

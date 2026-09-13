@@ -12,9 +12,18 @@ from .linkcheck import check_link
 from .prober import ENTRY_PATHS, probe_batch, probe_site, result_to_row
 from .util import parse_duration_hours
 
-BUCKETS = ("A", "B", "C", "D", "stale", "unknown")
+BUCKETS = ("A", "B", "C", "D", "stale", "no_channel", "unknown")
 CAPTCHA_TYPES = ("none", "recaptcha", "hcaptcha", "cloudflare", "email_verify", "unknown")
 ATTEMPT_STATUSES = ("submitted", "approved", "rejected", "published", "no_response")
+WAIT_PRESETS = (
+    ("1", "几天内", "几天内"),
+    ("2", "1-2 周", "1-2 周"),
+    ("3", "2-4 周", "2-4 周"),
+    ("4", "1-3 个月", "1-3 个月"),
+    ("5", "3-12 个月", "3-12 个月"),
+    ("6", "一年以上", "一年以上"),
+    ("0", "不确定/跳过", None),
+)
 
 
 @click.group()
@@ -127,7 +136,7 @@ def probe_cmd(ctx: click.Context, niche: str | None, limit: int, concurrency: in
 
 @main.command(name="queue")
 @click.option("--niche", default=None)
-@click.option("--exclude-bucket", multiple=True, default=("D",), show_default=True)
+@click.option("--exclude-bucket", multiple=True, default=("D", "no_channel"), show_default=True)
 @click.option("--exclude-stale/--include-stale", default=True, show_default=True)
 @click.pass_context
 def queue_cmd(ctx: click.Context, niche: str | None, exclude_bucket: tuple[str, ...], exclude_stale: bool) -> None:
@@ -163,7 +172,7 @@ def queue_cmd(ctx: click.Context, niche: str | None, exclude_bucket: tuple[str, 
         shown += 1
         flag = "confirmed" if confirmed else "predicted"
         click.echo(
-            f"{r['domain']:35s} [{flag:9s}] bucket={effective:8s} "
+            f"{r['domain']:35s} [{flag:9s}] bucket={effective:11s} "
             f"conf={r['predict_confidence'] or 0:.2f} entry={r['entry_url'] or '-'} "
             f"latest_post={r['latest_author_post'] or '-'}"
         )
@@ -174,8 +183,11 @@ def queue_cmd(ctx: click.Context, niche: str | None, exclude_bucket: tuple[str, 
 @click.argument("domain")
 @click.option("--bucket", type=click.Choice(BUCKETS), default=None)
 @click.option("--reason", default=None)
+@click.option("--suitable-for", default=None, help="这个位置适合哪类目标站，逗号分隔（如 tools,ai）")
+@click.option("--wait", "expected_wait", default=None, help="预计要等多久出结果（B/C 桶用）")
 @click.pass_context
-def confirm_cmd(ctx: click.Context, domain: str, bucket: str | None, reason: str | None) -> None:
+def confirm_cmd(ctx: click.Context, domain: str, bucket: str | None, reason: str | None,
+                 suitable_for: str | None, expected_wait: str | None) -> None:
     """人工确认最终桶位，写回 sites.bucket。"""
     conn = ctx.obj
     domain = normalize_domain(domain)
@@ -202,7 +214,8 @@ def confirm_cmd(ctx: click.Context, domain: str, bucket: str | None, reason: str
             click.echo("这个域名还没被探测过。")
         options = [
             ("a", "A 即时自助", "A"), ("b", "B 快审", "B"), ("c", "C 慢队列", "C"),
-            ("d", "D 假免费", "D"), ("s", "stale 已死", "stale"), ("u", "unknown 待定", "unknown"),
+            ("d", "D 假免费", "D"), ("s", "stale 已死", "stale"),
+            ("x", "no_channel 没有外链渠道，直接跳过", "no_channel"), ("u", "unknown 待定", "unknown"),
         ]
         default = predicted if predicted in BUCKETS else None
         bucket = select_key(f"确认 {domain} 的最终桶位：", options, default=default)
@@ -210,12 +223,26 @@ def confirm_cmd(ctx: click.Context, domain: str, bucket: str | None, reason: str
     if reason is None:
         reason = predicted_reason
 
+    # only worth asking these for buckets where they mean something —
+    # a dead/no-channel/undetermined site has no "suitable for" or "wait".
+    if bucket in ("A", "B", "C", "D"):
+        if suitable_for is None:
+            suitable_for = click.prompt(
+                "适合什么类型的目标站（工具/AI/内容站/通用，逗号分隔，回车跳过）",
+                default=site["suitable_for"] or "", show_default=False,
+            ) or None
+        if bucket in ("B", "C") and expected_wait is None:
+            expected_wait = select_key("预计要等多久出结果：", WAIT_PRESETS, default=None)
+
     conn.execute(
-        "UPDATE sites SET bucket = ?, bucket_reason = ?, last_verified = ? WHERE id = ?",
-        (bucket, reason, now_iso(), site["id"]),
+        """UPDATE sites SET bucket = ?, bucket_reason = ?, last_verified = ?,
+                             suitable_for = COALESCE(?, suitable_for),
+                             expected_wait = COALESCE(?, expected_wait)
+           WHERE id = ?""",
+        (bucket, reason, now_iso(), suitable_for, expected_wait, site["id"]),
     )
     conn.commit()
-    click.echo(f"{domain} -> {bucket}")
+    click.echo(f"{domain} -> {bucket}" + (f" (适合: {suitable_for})" if suitable_for else ""))
 
 
 @main.command(name="log")
@@ -461,15 +488,16 @@ def stats_cmd(ctx: click.Context, niche: str | None) -> None:
     dist = stats_mod.bucket_distribution(conn, niche)
     total_sites = sum(dist.values())
     attempts = stats_mod.attempt_stats(conn, niche)
+    turnaround = stats_mod.turnaround_days_stats(conn, niche)
     survival = stats_mod.survival_rate_90d(conn, niche)
 
     click.echo(f"=== bl stats{f' --niche {niche}' if niche else ''} ===\n")
 
     click.echo("四桶占比：")
-    for b in ("A", "B", "C", "D", "stale", "unknown"):
+    for b in ("A", "B", "C", "D", "stale", "no_channel", "unknown"):
         n = dist.get(b, 0)
         pct = (n / total_sites * 100) if total_sites else 0
-        click.echo(f"  {b:8s} {n:5d}  ({pct:5.1f}%)")
+        click.echo(f"  {b:11s} {n:5d}  ({pct:5.1f}%)")
     click.echo(f"  合计 {total_sites}\n")
 
     click.echo("投递情况：")
@@ -482,6 +510,13 @@ def stats_cmd(ctx: click.Context, niche: str | None) -> None:
     click.echo(f"  平均每次投递耗时: {avg:.1f} 分钟" if avg is not None else "  平均耗时: 数据不足")
     avg_pub = attempts["avg_time_per_published_min"]
     click.echo(f"  每条成品链接平均耗时: {avg_pub:.1f} 分钟" if avg_pub is not None else "  每条链接平均耗时: 数据不足")
+    if turnaround["n"]:
+        click.echo(
+            f"  提交到出结果实际等待: 平均 {turnaround['avg_days']:.1f} 天，最长 {turnaround['max_days']:.1f} 天"
+            f"（样本 {turnaround['n']} 条，用 bl update 更新过状态的才算）"
+        )
+    else:
+        click.echo("  提交到出结果的等待天数: 数据不足")
     click.echo()
 
     click.echo("90 天存活率：")
