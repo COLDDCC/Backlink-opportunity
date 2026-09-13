@@ -1,0 +1,24 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "backlink-opportunity"
+version = "0.1.0"
+description = "免费外链位置库 —— 记录层 + 探测器 + 复检任务（第一阶段）"
+requires-python = ">=3.10"
+dependencies = [
+    "click>=8.1",
+    "requests>=2.31",
+]
+
+[project.scripts]
+bl = "bl.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/bl"]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.0",
+]

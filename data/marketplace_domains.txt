@@ -1,0 +1,6 @@
+# 本地可维护的外链市场域名黑名单。
+# 一行一个域名，命中即视为 D 桶信号「外链市场有报价」。
+# 抓取 Collaborator / Adsy / PRPosting / Getfluence 公开目录的自动化留到后面阶段，
+# 现在先手工往这里加你确认过的域名。
+#
+# example-marketplace-listed-site.com
